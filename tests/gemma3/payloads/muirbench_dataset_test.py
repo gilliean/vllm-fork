@@ -6,8 +6,8 @@ from argparse import Namespace
 from collections.abc import Iterable
 from transformers import AutoTokenizer
 
-import asyncio
 import requests
+from multiprocessing import Pool
 muirbench_ckpt = 'MUIRBENCH/MUIRBENCH'
 # vision_arena_ckpt = 'lmarena-ai/vision-arena-bench-v0.1'
 
@@ -159,33 +159,31 @@ def get_answer_from_response_json(response: dict):
         return match[-1][1]  # match is likely to be e.g. ['(B)']
 
 
-async def submit_prompt(args, payloads, index):
+def submit_prompt(args, payload_dict, index):
     api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
 
-    async with semaphore:
-        payload_dict = payloads[index]
-        try:
-            response = post_http_request(payload_dict, api_url, args.max_tokens, False)
+    try:
+        response = post_http_request(payload_dict, api_url, args.max_tokens, False)
 
-            print(f'Output from prompt #{index}')
+        print(f'Output from prompt #{index}')
 
-            output_json = get_response(response)
-            answer = get_answer_from_dataset(dataset, args.starting_prompt_number+index)
-            response = get_answer_from_response_json(output_json)            
-        except Exception:
-            print('!'*20)
-            print(f'Error while processing prompt #{index}')
-            return None, None
+        output_json = get_response(response)
+        answer = get_answer_from_dataset(dataset, args.starting_prompt_number+index)
+        response = get_answer_from_response_json(output_json)            
+    except Exception:
+        print('!'*20)
+        print(f'Error while processing prompt #{index}')
+        return None, None
         
-        print(output_json)
+    print(output_json)
 
-        return answer, response
+    return answer, response
 
 def main(args: Namespace):
-    asyncio.run(process_prompts(args))
+    process_prompts(args)
 
 
-async def process_prompts(args: Namespace):
+def process_prompts(args: Namespace):
     global dataset
     dataset = map_filter_dataset(dataset_ckpt=args.dataset, filter_value=args.task)
     image_column = DATASET_TEXT_IMAGE_COLUMN_MAP[args.dataset]['image']
@@ -193,8 +191,7 @@ async def process_prompts(args: Namespace):
     num_prompts = args.num_prompts
 
     batch_size = args.batch_size
-    global semaphore
-    semaphore = asyncio.Semaphore(batch_size)
+#    global semaphore
 
     answer_response_set = {'task': args.task}  #, 'answer-responses': {}}
     # answer_responses = answer_response_set['answer-responses']
@@ -204,10 +201,12 @@ async def process_prompts(args: Namespace):
         payload_dict = make_payload_dict(dataset, idx, tokenizer, image_column, model='google/gemma-3-27b-it', instruction=args.instruction)
         payloads.append(payload_dict)
 
-    tasks = [asyncio.create_task(submit_prompt(args, payloads, i)) for i in range(len(payloads))]
-    results = await asyncio.gather(*tasks)
+    starmap_args = [(args, payload, i) for i, payload in enumerate(payloads)]
 
-    answer_responses = {i: (answer, response) for i, (answer, response) in enumerate(results)}
+    with Pool(batch_size) as pool:
+        responses = pool.starmap(submit_prompt, starmap_args)
+
+    answer_responses = {i: (answer, response) for i, (answer, response) in enumerate(responses)}
     answer_response_set['answer-responses'] = answer_responses
 
     # answer_responses[idx] = [answer, response]
