@@ -11,6 +11,26 @@ import numpy as np
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import argparse
+
+# USAGE
+# 1. Using OPENROUTER:
+# Set your OpenRouter API key in the environment variable before running the script:
+# export OPENROUTER_API_KEY="YOUR Openrouter API KEY"
+#
+# 1.1 List all available subjects
+# python evaluate_mmlu_vllm_online.py --list-subjects
+# 1.2 Evaluate high_school_mathematics and high_school_physics subjects with max 10 questions each and batch size of 16
+# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b:free  --subjects high_school_mathematics  high_school_physics  --max-questions 10 --batch-size 16
+# 1.3 Evaluate ALL subjects with max 10 questions each and batch size of 16
+# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b:free  --max-questions 10 --batch-size 32
+#
+# 2. Using local vLLM server:
+# 2.1 Start vLLM server (adjust model name and parameters as needed)
+# 2.2 Evaluate high_school_mathematics and high_school_physics subjects with max 10 questions each
+# unset OPENROUTER_API_KEY
+# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b  --subjects high_school_mathematics  high_school_physics  --max-questions 10 
+
 
 # -------------------------------
 # PERFORMANCE METRICS TRACKED:
@@ -24,11 +44,23 @@ import threading
 # CONFIGURATION
 # -------------------------------
 MODEL_NAME = "meta-llama/Llama-3.1-405B-Instruct"  # Updated to match your command
-BATCH_SIZE = 32
-MAX_TOKENS = 8
+BATCH_SIZE = 128
+MAX_OUTPUT_TOKENS = 4096
 TEMPERATURE = 0.0
 API_BASE_URL = "http://localhost:8080/v1"
 API_SERVER_PORT = 8080
+REQUEST_TIMEOUT = 200  # seconds
+MAX_NUM_QUESTIONS = 10
+OPENROUTER_URL = f"{os.getenv('OPENROUTER_API_BASE_URL', 'https://openrouter.ai/api/v1').rstrip('/')}" #/chat/completions"
+
+# Get API key from environment variable
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+if not OPENROUTER_API_KEY:
+    print("Warning: OPENROUTER_API_KEY environment variable not set")
+    print(f"Using default API endpoint: {API_BASE_URL}")    
+else:
+    API_BASE_URL = OPENROUTER_URL
+    print(f"Using OpenRouter API endpoint: {API_BASE_URL}")
 
 # vLLM API Server Configuration
 VLLM_SERVER_CMD = [
@@ -39,7 +71,7 @@ VLLM_SERVER_CMD = [
     "--dtype", "bfloat16",
     "--gpu-memory-util", "0.95",
     "--tensor-parallel-size", "8",
-    "--max-model-len", "4300",
+    "--max-model-len", "8196",
     "--block-size", "256",
     "--num_scheduler_steps", "1",
     "--max-num-batched-tokens", "32768",
@@ -107,7 +139,7 @@ def stop_vllm_server(process):
             process.kill()
         print("✓ Server stopped")
 
-def make_api_request(prompt, max_tokens=MAX_TOKENS, temperature=TEMPERATURE):
+def make_api_request(prompt, max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE):
     """Make a completion request to the vLLM API server"""
     payload = {
         "model": MODEL_NAME,
@@ -119,12 +151,21 @@ def make_api_request(prompt, max_tokens=MAX_TOKENS, temperature=TEMPERATURE):
     
     start_time = time.time()
     
+    # Prepare headers with API key
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # Add Authorization header if API key is provided
+    if OPENROUTER_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
+    
     try:
         response = requests.post(
             f"{API_BASE_URL}/completions",
             json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=60
+            headers=headers,
+            timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
         
@@ -138,6 +179,9 @@ def make_api_request(prompt, max_tokens=MAX_TOKENS, temperature=TEMPERATURE):
         # Calculate metrics
         end_to_end_latency = end_time - start_time
         output_text = choice["text"]
+
+        print("prompt:", prompt)
+        print("output_text:", output_text)
         
         # Estimate tokens (since API might not always provide exact counts)
         prompt_tokens = usage.get("prompt_tokens", len(prompt.split()) * 1.3)
@@ -158,48 +202,53 @@ def make_api_request(prompt, max_tokens=MAX_TOKENS, temperature=TEMPERATURE):
         return None
 
 # -------------------------------
-# LOAD MODEL (replaced with API server startup)
+# PARSE COMMAND LINE ARGUMENTS
 # -------------------------------
-# server_process = None
-# try:
-#     server_process = start_vllm_server()
-#     if not server_process:
-#         print("Failed to start vLLM server. Exiting.")
-#         sys.exit(1)
-# except KeyboardInterrupt:
-#     print("\nInterrupted during server startup")
-#     sys.exit(1)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate MMLU dataset with vLLM API")
+    parser.add_argument(
+        "--subjects",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of subjects to evaluate (space-separated). If not provided, all subjects will be evaluated. "
+             "Example: --subjects abstract_algebra anatomy business_ethics"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="give name of model to use. If not provided, default model will be used."
+    )
+    parser.add_argument(
+        "--list-subjects",
+        action="store_true",
+        help="List all available subjects and exit"
+    )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help="Maximum number of questions per subject (default: all questions)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for processing (default: 32)"
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=200,
+        help="Request timeout in seconds (default: 200)"
+    )
+    return parser.parse_args()
 
-# -------------------------------
-# LOAD DATASET
-# -------------------------------
-print("Loading MMLU dataset...")
-mmlu = load_dataset("cais/mmlu", "all")
-dataset_subset_name_to_use = "test"
-mmlu_test = mmlu[dataset_subset_name_to_use]
-subjects = set(mmlu_test["subject"])
-# os.environ["VLLM_SKIP_WARMUP"] = "true"
 
-print(f"Subjects loaded: {len(subjects)} total")
-
-# -------------------------------
-# PROMPT TEMPLATE
-# -------------------------------
-PROMPT_TEMPLATE = """The following are multiple choice questions (with answers) about {subject}.
-
-Question: {question}
-A. {A}
-B. {B}
-C. {C}
-D. {D}
-Answer:"""
-
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
-def format_prompt(example, subject):
+def format_prompt(example, prompt_template, subject):
     choices = example["choices"]
-    return PROMPT_TEMPLATE.format(
+    return prompt_template.format(
         subject=subject.replace("_", " "),
         question=example["question"],
         A=choices[0],
@@ -209,47 +258,15 @@ def format_prompt(example, subject):
     )
 
 def extract_choice(output_text):
-    # match = re.findall(r'\([A-Z]\)', output_text)
-    # if len(match) == 0:
-    #     return 'NA'
-    # else:
-    #     return match[-1][1]  # match is likely to be e.g. ['(B)']    
-    match = re.search(r"\b([A-D])\b", output_text.strip())
+    # Look for pattern like (A), (B), (C), or (D)
+    # match = re.search(r"\b([A-D])\b", output_text.strip())
+    
+    match = re.search(r'\(([A-D])\)', output_text)
     return match.group(1) if match else None
 
 def safe_get_metrics(request_output):
     """Safely extract metrics from API response"""
     return request_output.get("usage", {})
-
-# -------------------------------
-# RUN EVALUATION
-# -------------------------------
-results = {}
-overall_correct, overall_total = 0, 0
-
-# Performance metrics tracking
-all_ttft_times = []
-all_tpot_times = []
-all_output_throughput = []
-all_total_throughput = []
-all_end_to_end_latency = []
-all_input_tokens = []
-all_output_tokens = []
-
-# -------------------------------
-# RUN EVALUATION
-# -------------------------------
-results = {}
-overall_correct, overall_total = 0, 0
-
-# Performance metrics tracking
-all_ttft_times = []
-all_tpot_times = []
-all_output_throughput = []
-all_total_throughput = []
-all_end_to_end_latency = []
-all_input_tokens = []
-all_output_tokens = []
 
 def cleanup_and_exit(signum=None, frame=None):
     """Cleanup function to stop server on exit"""
@@ -258,164 +275,279 @@ def cleanup_and_exit(signum=None, frame=None):
         stop_vllm_server(server_process)
     sys.exit(0)
 
-# Register cleanup function
-# signal.signal(signal.SIGINT, cleanup_and_exit)
-# signal.signal(signal.SIGTERM, cleanup_and_exit)
+def main():
+    global server_process
+    server_process = None
+    # -------------------------------
+    # LOAD DATASET
+    # -------------------------------
+    print("Loading MMLU dataset...")
+    mmlu = load_dataset("cais/mmlu", "all")
+    dataset_subset_name_to_use = "test"
+    mmlu_test = mmlu[dataset_subset_name_to_use]
+    all_subjects = sorted(set(mmlu_test["subject"]))
 
-try:
-    for subject in subjects:
-        data = mmlu_test.filter(lambda x: x["subject"] == subject)
-        prompts = [format_prompt(x, subject) for x in data]
+    # Parse command line arguments
+    args = parse_args()
 
-        print(f"\nEvaluating {subject} ({len(prompts)} samples)...")
-        subject_correct = 0
+    # If --list-subjects is provided, print subjects and exit
+    if args.list_subjects:
+        print(f"\nAvailable subjects ({len(all_subjects)}):")
+        for i, subject in enumerate(all_subjects, 1):
+            print(f"  {i:2d}. {subject}")
+        sys.exit(0)
 
-        for i in tqdm(range(0, len(prompts), BATCH_SIZE)):
-            batch_prompts = prompts[i:i+BATCH_SIZE]
+    if args.model:
+        MODEL_NAME = args.model
+        # VLLM_SERVER_CMD[4] = MODEL_NAME  # Update model in server command
+
+    # Update configuration from command line arguments
+    if args.max_questions:
+        MAX_NUM_QUESTIONS = args.max_questions
+
+    if args.batch_size:
+        BATCH_SIZE = args.batch_size
+
+    if args.request_timeout:
+        REQUEST_TIMEOUT = args.request_timeout
+
+    # Filter subjects based on command line argument
+    if args.subjects:
+        # Validate that provided subjects exist
+        invalid_subjects = [s for s in args.subjects if s not in all_subjects]
+        if invalid_subjects:
+            print(f"\n❌ Error: Invalid subjects provided: {', '.join(invalid_subjects)}")
+            print(f"\nUse --list-subjects to see all available subjects")
+            sys.exit(1)
+        
+        subjects = args.subjects
+        print(f"\n✓ Selected {len(subjects)} subject(s): {', '.join(subjects)}")
+    else:
+        subjects = all_subjects
+        print(f"\n✓ Evaluating all {len(subjects)} subjects")
+
+
+    print(f"Configuration:")
+    print(f"  - Batch size: {BATCH_SIZE}")
+    print(f"  - Max questions per subject: {MAX_NUM_QUESTIONS if MAX_NUM_QUESTIONS else 'All'}")
+    print(f"  - API Base URL: {API_BASE_URL}")
+
+    # -------------------------------
+    # HELPER FUNCTIONS
+    # -------------------------------
+    PROMPT_TEMPLATE = """The following are multiple choice questions (with answers) about {subject}.
+
+    Question: {question}  Provide one correct answer: A, B, C, or D at the end of your reasoning within a pair of parentheses, e.g. "Answer is (A)", "The answer is (B)", "Answer is (C)", or "Answer is (D)". Keep your reasoning brief.
+    A. {A}
+    B. {B}
+    C. {C}
+    D. {D}
+    Answer:"""
+
+    # -------------------------------
+    # RUN EVALUATION
+    # -------------------------------
+    results = {}
+    overall_correct, overall_total = 0, 0
+
+    # Performance metrics tracking
+    all_ttft_times = []
+    all_tpot_times = []
+    all_output_throughput = []
+    all_total_throughput = []
+    all_end_to_end_latency = []
+    all_input_tokens = []
+    all_output_tokens = []
+
+    # -------------------------------
+    # RUN EVALUATION
+    # -------------------------------
+    results = {}
+    overall_correct, overall_total = 0, 0
+
+    # Performance metrics tracking
+    all_ttft_times = []
+    all_tpot_times = []
+    all_output_throughput = []
+    all_total_throughput = []
+    all_end_to_end_latency = []
+    all_input_tokens = []
+    all_output_tokens = []
+
+
+    # Register cleanup function
+    # signal.signal(signal.SIGINT, cleanup_and_exit)
+    # signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+    try:
+        for subject in subjects:
+            data = mmlu_test.filter(lambda x: x["subject"] == subject)
             
-            # Process batch using API requests
-            batch_start_time = time.time()
-            batch_results = []
+            # Limit number of questions if MAX_NUM_QUESTIONS is set
+            num_questions = min(len(data), MAX_NUM_QUESTIONS) if MAX_NUM_QUESTIONS else len(data)
+            data = data.select(range(num_questions))
             
-            # Use ThreadPoolExecutor for concurrent API calls
-            with ThreadPoolExecutor(max_workers=min(len(batch_prompts), 8)) as executor:
-                future_to_idx = {
-                    executor.submit(make_api_request, prompt): j 
-                    for j, prompt in enumerate(batch_prompts)
-                }
+            prompts = [format_prompt(x, PROMPT_TEMPLATE, subject) for x in data]
+
+            print(f"\nEvaluating {subject} ({len(prompts)} samples)...")
+            subject_correct = 0
+
+            for i in tqdm(range(0, len(prompts), BATCH_SIZE)):
+                batch_prompts = prompts[i:i+BATCH_SIZE]
                 
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            batch_results.append((idx, result))
-                    except Exception as e:
-                        print(f"Request failed for batch item {idx}: {e}")
-                        batch_results.append((idx, None))
-            
-            batch_end_time = time.time()
-            batch_end_to_end_latency = batch_end_time - batch_start_time
-            
-            # Sort results by original order
-            batch_results.sort(key=lambda x: x[0])
-            
-            for j, (original_idx, api_result) in enumerate(batch_results):
-                if api_result is None:
-                    continue
+                # Process batch using API requests
+                batch_start_time = time.time()
+                batch_results = []
+                
+                # Use ThreadPoolExecutor for concurrent API calls
+                with ThreadPoolExecutor(max_workers=min(len(batch_prompts), BATCH_SIZE)) as executor:
+                    future_to_idx = {
+                        executor.submit(make_api_request, prompt): j 
+                        for j, prompt in enumerate(batch_prompts)
+                    }
                     
-                output_text = api_result["text"].strip()
-                pred_choice = extract_choice(output_text)
-                gold_idx = data[i+original_idx]["answer"]
-                gold_choice = chr(ord("A") + gold_idx)
-                if pred_choice == gold_choice:
-                    subject_correct += 1
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            result = future.result()
+                            if result:
+                                batch_results.append((idx, result))
+                        except Exception as e:
+                            print(f"Request failed for batch item {idx}: {e}")
+                            batch_results.append((idx, None))
                 
-                # Extract performance metrics from API response
-                end_to_end_latency = api_result["end_to_end_latency"]
-                prompt_tokens = api_result["prompt_tokens"]
-                completion_tokens = api_result["completion_tokens"]
-                total_tokens = api_result["total_tokens"]
+                batch_end_time = time.time()
+                batch_end_to_end_latency = batch_end_time - batch_start_time
                 
-                # Store metrics
-                all_end_to_end_latency.append(end_to_end_latency)
-                all_input_tokens.append(prompt_tokens)
-                all_output_tokens.append(completion_tokens)
+                # Sort results by original order
+                batch_results.sort(key=lambda x: x[0])
+                print(f"Subject: {subject}")
+                print(f"number of results: {len(batch_results)}")
                 
-                # Calculate throughputs
-                if end_to_end_latency > 0:
-                    output_throughput = completion_tokens / end_to_end_latency
-                    total_throughput = total_tokens / end_to_end_latency
-                    all_output_throughput.append(output_throughput)
-                    all_total_throughput.append(total_throughput)
-                
-                # Note: TTFT and TPOT are not directly available from the API
-                # These would require streaming responses to measure accurately
-                # For now, we'll estimate based on total latency
-                if completion_tokens > 0:
-                    estimated_tpot = end_to_end_latency / completion_tokens
-                    all_tpot_times.append(estimated_tpot)
+                for j, (original_idx, api_result) in enumerate(batch_results):
+                    if api_result is None:
+                        continue
+                        
+                    output_text = api_result["text"].strip()
+                    pred_choice = extract_choice(output_text)
+                    gold_idx = data[i+original_idx]["answer"]
+                    gold_choice = chr(ord("A") + gold_idx)
+
+                    print("\tPredicted choice:", pred_choice)
+                    print("\tGold choice:", gold_choice)
+                    if pred_choice == gold_choice:
+                        subject_correct += 1
+                        print(f"\t✓ Correct: {subject_correct}")
                     
-                    # Rough TTFT estimation (assume first token takes similar time as others)
-                    estimated_ttft = estimated_tpot
-                    all_ttft_times.append(estimated_ttft)
+                    # Extract performance metrics from API response
+                    end_to_end_latency = api_result["end_to_end_latency"]
+                    prompt_tokens = api_result["prompt_tokens"]
+                    completion_tokens = api_result["completion_tokens"]
+                    total_tokens = api_result["total_tokens"]
+                    
+                    # Store metrics
+                    all_end_to_end_latency.append(end_to_end_latency)
+                    all_input_tokens.append(prompt_tokens)
+                    all_output_tokens.append(completion_tokens)
+                    
+                    # Calculate throughputs
+                    if end_to_end_latency > 0:
+                        output_throughput = completion_tokens / end_to_end_latency
+                        total_throughput = total_tokens / end_to_end_latency
+                        all_output_throughput.append(output_throughput)
+                        all_total_throughput.append(total_throughput)
+                    
+                    # Note: TTFT and TPOT are not directly available from the API
+                    # These would require streaming responses to measure accurately
+                    # For now, we'll estimate based on total latency
+                    if completion_tokens > 0:
+                        estimated_tpot = end_to_end_latency / completion_tokens
+                        all_tpot_times.append(estimated_tpot)
+                        
+                        # Rough TTFT estimation (assume first token takes similar time as others)
+                        estimated_ttft = estimated_tpot
+                        all_ttft_times.append(estimated_ttft)
 
-        acc = subject_correct / len(prompts)
-        results[subject] = acc
-        overall_correct += subject_correct
-        overall_total += len(prompts)
-        print(f"{subject:30s} Accuracy: {acc:.3f}")
+            print(f"subject_correct: {subject_correct}, total: {len(prompts)}")
+            acc = subject_correct / len(prompts)
+            results[subject] = acc
+            overall_correct += subject_correct
+            overall_total += len(prompts)
+            print(f"{subject:30s} Accuracy: {acc:.3f}")
 
-finally:
-    # Ensure server is stopped
-    #cleanup_and_exit()
-    pass
+    finally:
+        # Ensure server is stopped
+        #cleanup_and_exit()
+        pass
 
-# -------------------------------
-# FINAL SUMMARY
-# -------------------------------
-overall_acc = overall_correct / overall_total
-print("\n========== FINAL RESULTS ==========")
-for s, a in sorted(results.items(), key=lambda x: x[1], reverse=True):
-    print(f"{s:30s}: {a:.3f}")
-print(f"\nOverall Accuracy: {overall_acc:.3f}")
+    # -------------------------------
+    # FINAL SUMMARY
+    # -------------------------------
+    overall_acc = overall_correct / overall_total
+    print("\n========== FINAL RESULTS ==========")
+    for s, a in sorted(results.items(), key=lambda x: x[1], reverse=True):
+        print(f"{s:30s}: {a:.3f}")
+    print(f"\nOverall Accuracy: {overall_acc:.3f}")
 
-# -------------------------------
-# PERFORMANCE METRICS SUMMARY
-# -------------------------------
-print("\n========== PERFORMANCE METRICS ==========")
-print("Note: TTFT and TPOT are estimated from total latency when using non-streaming API")
-print("For accurate TTFT/TPOT measurements, consider using streaming API endpoints")
+    # -------------------------------
+    # PERFORMANCE METRICS SUMMARY
+    # -------------------------------
+    print("\n========== PERFORMANCE METRICS ==========")
+    print("Note: TTFT and TPOT are estimated from total latency when using non-streaming API")
+    print("For accurate TTFT/TPOT measurements, consider using streaming API endpoints")
 
-if all_ttft_times:
-    avg_ttft = np.mean(all_ttft_times)
-    p50_ttft = np.median(all_ttft_times)
-    p95_ttft = np.percentile(all_ttft_times, 95)
-    print(f"\nEstimated Time To First Token (TTFT):")
-    print(f"  Average: {avg_ttft:.4f} seconds")
-    print(f"  Median (P50): {p50_ttft:.4f} seconds")
-    print(f"  P95: {p95_ttft:.4f} seconds")
+    if all_ttft_times:
+        avg_ttft = np.mean(all_ttft_times)
+        p50_ttft = np.median(all_ttft_times)
+        p95_ttft = np.percentile(all_ttft_times, 95)
+        print(f"\nEstimated Time To First Token (TTFT):")
+        print(f"  Average: {avg_ttft:.4f} seconds")
+        print(f"  Median (P50): {p50_ttft:.4f} seconds")
+        print(f"  P95: {p95_ttft:.4f} seconds")
 
-if all_tpot_times:
-    avg_tpot = np.mean(all_tpot_times)
-    p50_tpot = np.median(all_tpot_times)
-    p95_tpot = np.percentile(all_tpot_times, 95)
-    print(f"\nEstimated Time Per Output Token (TPOT):")
-    print(f"  Average: {avg_tpot:.4f} seconds")
-    print(f"  Median (P50): {p50_tpot:.4f} seconds")
-    print(f"  P95: {p95_tpot:.4f} seconds")
+    if all_tpot_times:
+        avg_tpot = np.mean(all_tpot_times)
+        p50_tpot = np.median(all_tpot_times)
+        p95_tpot = np.percentile(all_tpot_times, 95)
+        print(f"\nEstimated Time Per Output Token (TPOT):")
+        print(f"  Average: {avg_tpot:.4f} seconds")
+        print(f"  Median (P50): {p50_tpot:.4f} seconds")
+        print(f"  P95: {p95_tpot:.4f} seconds")
 
-if all_output_throughput:
-    avg_output_throughput = np.mean(all_output_throughput)
-    p50_output_throughput = np.median(all_output_throughput)
-    print(f"\nOutput Throughput:")
-    print(f"  Average: {avg_output_throughput:.2f} tokens/second")
-    print(f"  Median (P50): {p50_output_throughput:.2f} tokens/second")
+    if all_output_throughput:
+        avg_output_throughput = np.mean(all_output_throughput)
+        p50_output_throughput = np.median(all_output_throughput)
+        print(f"\nOutput Throughput:")
+        print(f"  Average: {avg_output_throughput:.2f} tokens/second")
+        print(f"  Median (P50): {p50_output_throughput:.2f} tokens/second")
 
-if all_total_throughput:
-    avg_total_throughput = np.mean(all_total_throughput)
-    p50_total_throughput = np.median(all_total_throughput)
-    print(f"\nTotal Token Throughput:")
-    print(f"  Average: {avg_total_throughput:.2f} tokens/second")
-    print(f"  Median (P50): {p50_total_throughput:.2f} tokens/second")
+    if all_total_throughput:
+        avg_total_throughput = np.mean(all_total_throughput)
+        p50_total_throughput = np.median(all_total_throughput)
+        print(f"\nTotal Token Throughput:")
+        print(f"  Average: {avg_total_throughput:.2f} tokens/second")
+        print(f"  Median (P50): {p50_total_throughput:.2f} tokens/second")
 
-if all_end_to_end_latency:
-    avg_e2e_latency = np.mean(all_end_to_end_latency)
-    p50_e2e_latency = np.median(all_end_to_end_latency)
-    p95_e2e_latency = np.percentile(all_end_to_end_latency, 95)
-    print(f"\nEnd-to-End Latency:")
-    print(f"  Average: {avg_e2e_latency:.4f} seconds")
-    print(f"  Median (P50): {p50_e2e_latency:.4f} seconds")
-    print(f"  P95: {p95_e2e_latency:.4f} seconds")
+    if all_end_to_end_latency:
+        avg_e2e_latency = np.mean(all_end_to_end_latency)
+        p50_e2e_latency = np.median(all_end_to_end_latency)
+        p95_e2e_latency = np.percentile(all_end_to_end_latency, 95)
+        print(f"\nEnd-to-End Latency:")
+        print(f"  Average: {avg_e2e_latency:.4f} seconds")
+        print(f"  Median (P50): {p50_e2e_latency:.4f} seconds")
+        print(f"  P95: {p95_e2e_latency:.4f} seconds")
 
-# Additional summary statistics
-total_input_tokens = sum(all_input_tokens) if all_input_tokens else 0
-total_output_tokens = sum(all_output_tokens) if all_output_tokens else 0
-total_tokens = total_input_tokens + total_output_tokens
+    # Additional summary statistics
+    total_input_tokens = sum(all_input_tokens) if all_input_tokens else 0
+    total_output_tokens = sum(all_output_tokens) if all_output_tokens else 0
+    total_tokens = total_input_tokens + total_output_tokens
 
-print(f"\n========== TOKEN STATISTICS ==========")
-print(f"Total Input Tokens: {total_input_tokens:,}")
-print(f"Total Output Tokens: {total_output_tokens:,}")
-print(f"Total Tokens: {total_tokens:,}")
-print(f"Average Input Tokens per Request: {np.mean(all_input_tokens):.1f}" if all_input_tokens else "N/A")
-print(f"Average Output Tokens per Request: {np.mean(all_output_tokens):.1f}" if all_output_tokens else "N/A")
+    print(f"\n========== TOKEN STATISTICS ==========")
+    print(f"Total Input Tokens: {total_input_tokens:,}")
+    print(f"Total Output Tokens: {total_output_tokens:,}")
+    print(f"Total Tokens: {total_tokens:,}")
+    print(f"Average Input Tokens per Request: {np.mean(all_input_tokens):.1f}" if all_input_tokens else "N/A")
+    print(f"Average Output Tokens per Request: {np.mean(all_output_tokens):.1f}" if all_output_tokens else "N/A")
+
+if __name__ == "__main__":
+    main()
