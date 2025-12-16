@@ -33,19 +33,19 @@ logger = logging.getLogger(__name__)
 # export OPENROUTER_API_KEY="YOUR Openrouter API KEY"
 #
 # 1.1 List all available subjects
-# python evaluate_mmlu_vllm_online.py --list-subjects
+# python evaluate_mmlu_vllm_online_openai.py --list-subjects
 # 1.2 Evaluate high_school_mathematics and high_school_physics subjects with max 10 questions each and batch size of 16
-# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b:free  --subjects high_school_mathematics  high_school_physics  --max-questions 10 --batch-size 16
+# python evaluate_mmlu_vllm_online_openai.py --model openai/gpt-oss-20b:free  --subjects high_school_mathematics  high_school_physics  --max-questions 10 --batch-size 16
 # 1.3 Evaluate ALL subjects with max 10 questions each and batch size of 32
-# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b:free  --max-questions 10 --batch-size 32
+# python evaluate_mmlu_vllm_online_openai.py --model openai/gpt-oss-20b:free  --max-questions 10 --batch-size 32
 #
 # 2. Using local vLLM server:
 # 2.1 Start vLLM server (adjust model name and parameters as needed)
 # 2.2 Evaluate high_school_mathematics and high_school_physics subjects with max 10 questions each
 # unset OPENROUTER_API_KEY
-# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b  --subjects high_school_mathematics  high_school_physics  --max-questions 10 
+# python evaluate_mmlu_vllm_online_openai.py --model openai/gpt-oss-20b  --subjects high_school_mathematics  high_school_physics  --max-questions 10 
 # 2.3 Evaluate ALL subjects with max 32 questions each and batch size of 32 with log-level DEBUG
-# python evaluate_mmlu_vllm_online.py --model openai/gpt-oss-20b  --max-questions 32 --batch-size 32 --log-level DEBUG
+# python evaluate_mmlu_vllm_online_openai.py --model openai/gpt-oss-20b  --max-questions 32 --batch-size 32 --log-level DEBUG
 # -------------------------------
 # PERFORMANCE METRICS TRACKED:
 # - TTFT (Time To First Token): Time from request to first token generation
@@ -285,11 +285,17 @@ def stop_vllm_server(process):
 def make_api_request(prompt: str, config: EvaluationConfig):
     """Make a completion request to the vLLM API server"""
     payload = {
-        "model": config.model_name,
-        "prompt": prompt,
-        "max_tokens": config.max_output_tokens,
-        "temperature": config.temperature,
-        "stream": False
+        "model": "/mnt/huggingface/hub/upstage-solar-pro2",
+        "messages": [
+            {"role": "system", "content": "You are a scholar with knowledge on various subjects."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt}
+            ]}
+        ]
+       ,
+       "max_tokens": config.max_output_tokens,
+       "temperature": config.temperature,
+       "stream": False
     }
     
     start_time = time.time()
@@ -305,7 +311,7 @@ def make_api_request(prompt: str, config: EvaluationConfig):
     
     try:
         response = requests.post(
-            f"{config.api_base_url}/completions",
+            f"{config.api_base_url}/chat/completions",
             json=payload,
             headers=headers,
             timeout=config.request_timeout
@@ -321,7 +327,7 @@ def make_api_request(prompt: str, config: EvaluationConfig):
         
         # Calculate metrics
         end_to_end_latency = end_time - start_time
-        output_text = choice["text"]
+        output_text = choice["message"]["content"]
 
         logger.debug(f"Prompt: {prompt[:100]}...")
         logger.debug(f"Output: {output_text[:100]}...")
@@ -459,7 +465,7 @@ def evaluate_subject(subject: str, data, config: EvaluationConfig,
     logger.info(f"Evaluating {subject} ({len(prompts)} samples)...")
     subject_correct = 0
 
-    for i in tqdm(range(0, len(prompts), config.batch_size), desc=f"Processing {subject}"):
+    for i in tqdm(range(0, len(prompts), config.batch_size), desc=f"Processing {subject} batches"):
         batch_prompts = prompts[i:i+config.batch_size]
         
         # Process batch using API requests
@@ -599,7 +605,8 @@ Answer:"""
     metrics = PerformanceMetrics()
 
     try:
-        for subject in subjects:
+        for i in tqdm(range(0, len(subjects)), desc="Evaluating subjects"):
+            subject = subjects[i]
             data = mmlu_test.filter(lambda x: x["subject"] == subject)
             subject_correct, subject_total = evaluate_subject(
                 subject, data, config, PROMPT_TEMPLATE, metrics
